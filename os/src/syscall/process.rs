@@ -1,9 +1,12 @@
 //! Process management syscalls
 use crate::{
-    config::MAX_SYSCALL_NUM,
+    config::{MAX_SYSCALL_NUM, PAGE_SIZE},
+    mm::write_to_user_byte_buffer,
     task::{
-        change_program_brk, exit_current_and_run_next, suspend_current_and_run_next, TaskStatus,
+        change_program_brk, current_user_token, exit_current_and_run_next,
+        suspend_current_and_run_next, TaskStatus, get_task_info, mmap, munmap
     },
+    timer::get_time_ms,
 };
 
 #[repr(C)]
@@ -17,11 +20,22 @@ pub struct TimeVal {
 #[allow(dead_code)]
 pub struct TaskInfo {
     /// Task status in it's life cycle
-    status: TaskStatus,
+    pub status: TaskStatus,
     /// The numbers of syscall called by task
-    syscall_times: [u32; MAX_SYSCALL_NUM],
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
     /// Total running time of task
-    time: usize,
+    pub time: usize,
+}
+
+impl TaskInfo {
+    /// init new TaskInfo
+    pub fn zero_init() -> Self {
+        Self {
+            status: TaskStatus::Ready,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            time: 0,
+        }
+    }
 }
 
 /// task exits and submit an exit code
@@ -41,29 +55,54 @@ pub fn sys_yield() -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
-    -1
+    let mut time = TimeVal { sec: 0, usec: 0 };
+    let time_ms = get_time_ms();
+    time.sec = time_ms / 1000;
+    time.usec = (time_ms % 1000) * 1000;
+
+    write_to_user_byte_buffer(current_user_token(),
+        ts as *const u8,
+        core::mem::size_of::<TimeVal>(),
+        unsafe { core::slice::from_raw_parts(&time as *const _ as *const u8, core::mem::size_of::<TimeVal>()) }
+    );
+
+    0
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
-pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
+pub fn sys_task_info(ti: *mut TaskInfo) -> isize {
     trace!("kernel: sys_task_info NOT IMPLEMENTED YET!");
-    -1
+    let task_info = get_task_info();
+    write_to_user_byte_buffer(current_user_token(),
+        ti as *const u8,
+        core::mem::size_of::<TaskInfo>(),
+        unsafe { core::slice::from_raw_parts(&task_info as *const _ as *const u8, core::mem::size_of::<TaskInfo>()) }
+    );
+
+    0
 }
 
 // YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
     trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
-    -1
+    if start & (PAGE_SIZE - 1) != 0 || prot & !0x7 != 0 || prot & 0x7 == 0 {
+        return -1;
+    }
+
+    mmap(start, len, prot)
 }
 
 // YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
-    -1
+    if start & (PAGE_SIZE - 1) != 0 {
+        return -1;
+    }
+    munmap(start, len)
 }
 /// change data segment size
 pub fn sys_sbrk(size: i32) -> isize {
