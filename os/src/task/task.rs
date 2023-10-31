@@ -2,7 +2,11 @@
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
+use crate::syscall::TaskInfo;
+use crate::timer::get_time_ms;
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::MapPermission;
+use crate::mm::{VPNRange, VirtPageNum};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
@@ -50,6 +54,9 @@ pub struct TaskControlBlockInner {
     /// Maintain the execution status of the current process
     pub task_status: TaskStatus,
 
+    /// Task infor
+    pub task_info: TaskInfo,
+
     /// Application address space
     pub memory_set: MemorySet,
 
@@ -68,6 +75,9 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// task priority
+    pub priority: isize,
 }
 
 impl TaskControlBlockInner {
@@ -112,12 +122,14 @@ impl TaskControlBlock {
                     base_size: user_sp,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
+                    task_info: TaskInfo::zero_init(),
                     memory_set,
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 100,
                 })
             },
         };
@@ -162,6 +174,52 @@ impl TaskControlBlock {
         // **** release inner automatically
     }
 
+    /// spawn tasks
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let mut parent_inner = self.inner_exclusive_access();
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    task_info: TaskInfo::zero_init(),
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    priority: 100,
+                })
+            },
+        });
+
+        parent_inner.children.push(task_control_block.clone());
+        // **** access child PCB exclusively
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize);
+
+        task_control_block
+    }
+
     /// parent process fork the child process
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         // ---- access parent PCB exclusively
@@ -185,12 +243,14 @@ impl TaskControlBlock {
                     base_size: parent_inner.base_size,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
                     task_status: TaskStatus::Ready,
+                    task_info: TaskInfo::zero_init(),
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: 100,
                 })
             },
         });
@@ -209,6 +269,13 @@ impl TaskControlBlock {
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// set priority
+    pub fn set_priority(self: &Arc<Self>, priority: isize) -> isize {
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority;
+        priority
     }
 
     /// change the location of the program break. return None if failed.
@@ -235,6 +302,74 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// Count syscalls
+    pub fn count_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner_exclusive_access();
+        let task_info = &mut inner.task_info;
+        task_info.syscall_times[syscall_id] += 1;
+    }
+
+    /// Get task infos
+    pub fn get_task_info(&self) -> TaskInfo {
+        let mut inner = self.inner_exclusive_access();
+        let task_info = &mut inner.task_info;
+        let now = get_time_ms();
+        let mut ts = TaskInfo::zero_init();
+        ts.status = TaskStatus::Running;
+        ts.time = now - task_info.time;
+        for i in 0..task_info.syscall_times.len() {
+            ts.syscall_times[i] = task_info.syscall_times[i];
+        }
+
+        ts
+    }
+
+    /// map task memory
+    pub fn mmap(self: &Arc<Self>, start: usize, len: usize, prot: usize) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let permission = MapPermission::from_bits((prot as u8) << 1).unwrap() | MapPermission::U;
+
+        let mut inner = self.inner_exclusive_access();
+
+        for vpn in VPNRange::new(VirtPageNum::from(start_va), end_va.ceil()) {
+            if let Some(pte) = inner.memory_set.translate(vpn) {
+                if pte.is_valid() {
+                    return -1;
+                }
+            }
+        }
+
+        inner.memory_set.insert_framed_area(start_va, end_va, permission);
+
+        0
+    }
+
+    /// munmap
+    pub fn munmap(self: &Arc<Self>, start: usize, len: usize) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+
+        let mut inner = self.inner_exclusive_access();
+
+        for vpn in VPNRange::new(VirtPageNum::from(start_va), end_va.ceil()) {
+            match inner.memory_set.translate(vpn) {
+                Some(pte) => {
+                    if !pte.is_valid() {
+                        return -1;
+                    }
+                },
+                None => {
+                    return -1;
+                }
+            }
+        }
+
+        inner.memory_set.remove_frame_area(start_va, end_va);
+
+        0
     }
 }
 
