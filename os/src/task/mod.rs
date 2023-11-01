@@ -18,6 +18,7 @@ use crate::timer::get_time;
 use crate::config::MAX_APP_NUM;
 use crate::syscall::process::TaskInfo;
 use crate::loader::{get_num_app, init_app_cx};
+use crate::timer::get_time_ms;
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
@@ -138,6 +139,31 @@ impl TaskManager {
             .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
     }
 
+
+    /// Count syscalls
+    pub fn count_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let task_info = &mut inner.tasks[cur].task_info;
+        task_info.syscall_times[syscall_id] += 1;
+    }
+
+    /// Get task infos
+    pub fn get_task_info(&self) -> TaskInfo {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let task_info = &inner.tasks[cur].task_info;
+        let now = get_time_ms();
+        let mut ts = TaskInfo::zero_init();
+        ts.status = TaskStatus::Running;
+        ts.time = now - task_info.time;
+        for i in 0..task_info.syscall_times.len() {
+            ts.syscall_times[i] = task_info.syscall_times[i];
+        }
+
+        ts
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -145,12 +171,10 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
-            inner.current_task = next;
-
-            let next_task = &mut inner.tasks[next];
-            if next_task.task_info.time == 0 {
-                next_task.task_info.time = get_time();
+            if inner.tasks[next].task_info.time == 0 {
+                inner.tasks[next].task_info.time = get_time_ms();
             }
+            inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
             drop(inner);
@@ -223,3 +247,14 @@ pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
 }
+
+/// Count syscalls
+pub fn count_syscall(syscall_id: usize) {
+    TASK_MANAGER.count_syscall(syscall_id);
+}
+
+/// Get task info
+pub fn get_task_info() -> TaskInfo {
+    TASK_MANAGER.get_task_info()
+}
+

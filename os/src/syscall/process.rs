@@ -1,8 +1,8 @@
 //! Process management syscalls
 use crate::{
     config::MAX_SYSCALL_NUM,
-    task::{exit_current_and_run_next, suspend_current_and_run_next, TaskStatus, TASK_MANAGER},
-    timer::get_time_us,
+    task::{exit_current_and_run_next, suspend_current_and_run_next, TaskStatus},
+    timer::get_time_ms,
 };
 
 #[repr(C)]
@@ -55,25 +55,20 @@ pub fn sys_yield() -> isize {
 /// get time with second and microsecond
 pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
-    let us = get_time_us();
+    let now = get_time_ms();
     unsafe {
-        *ts = TimeVal {
-            sec: us / 1_000_000,
-            usec: us % 1_000_000,
-        };
+        (*ts).sec = now / 1000;
+        (*ts).usec = (now % 1000) * 1000;
     }
+    
     0
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
 pub fn sys_task_info(ti: *mut TaskInfo) -> isize {
     trace!("kernel: sys_task_info");
-    let inner = TASK_MANAGER.inner.exclusive_access();
-    unsafe {
-        (*ti).status = inner.tasks[inner.current_task].task_status;
-        (*ti).syscall_times.clone_from(&inner.tasks[inner.current_task].task_info.syscall_times);
-        (*ti).time = 500; //inner.tasks[inner.current_task].user_time;
-    };
+    let info = crate::task::get_task_info();
+    unsafe { ti.copy_from(&info as *const _, core::mem::size_of::<TaskInfo>()); }
 
     0
 }
