@@ -2,7 +2,7 @@
 use crate::{
     config::MAX_SYSCALL_NUM,
     task::{exit_current_and_run_next, suspend_current_and_run_next, TaskStatus},
-    timer::get_time_ms,
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -17,14 +17,14 @@ pub struct TimeVal {
 
 /// Task information
 #[allow(dead_code)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct TaskInfo {
     /// Task status in it's life cycle
-    pub status: TaskStatus,
+    status: TaskStatus,
     /// The numbers of syscall called by task
-    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+    syscall_times: [u32; MAX_SYSCALL_NUM],
     /// Total running time of task
-    pub time: usize,
+    time: usize,
 }
 
 impl TaskInfo {
@@ -55,10 +55,12 @@ pub fn sys_yield() -> isize {
 /// get time with second and microsecond
 pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
-    let now = get_time_ms();
+    let now = get_time_us();
     unsafe {
-        (*ts).sec = now / 1000;
-        (*ts).usec = (now % 1000) * 1000;
+        *ts = TimeVal {
+            sec: now / 1_000_000,
+            usec: now % 1_000_000,
+        };
     }
     
     0
@@ -68,7 +70,10 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
 pub fn sys_task_info(ti: *mut TaskInfo) -> isize {
     trace!("kernel: sys_task_info");
     let info = crate::task::get_task_info();
-    unsafe { ti.copy_from(&info as *const _, core::mem::size_of::<TaskInfo>()); }
-
+    unsafe {
+        (*ti).status = info.0;
+        (*ti).time = info.1;
+        (*ti).syscall_times = info.2;
+    }
     0
 }
